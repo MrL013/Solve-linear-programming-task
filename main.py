@@ -497,7 +497,7 @@ def main():
     print("=" * 60)
 
     if result['status'] == 'success':
-        print("✓ Решение найдено!")
+        print("Решение найдено!")
         print(f"Оптимальное значение: Z = {result['optimal_value']:.6f}")
         print("Оптимальная точка:")
         for i, x_val in enumerate(result['optimal_point']):
@@ -517,7 +517,7 @@ def main():
         print(f"x₁ + x₄ = {constraint3:.6f} ≥ 3 ({constraint3 >= 3 - 1e-6})")
 
     else:
-        print("✗ Решение не найдено")
+        print("Решение не найдено")
         print(f"Причина: {result['message']}")
 
 
