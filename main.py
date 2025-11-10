@@ -1,524 +1,458 @@
-import numpy as np
+from __future__ import annotations
 import re
+import sys
+import time
+from dataclasses import dataclass
+from typing import List, Tuple, Optional, Dict
 
-class SimplexSolver:
-    def __init__(self):
-        self.A = None
-        self.b = None
-        self.c = None
-        self.basis = None
-        self.artificial_vars = []
-        self.problem_type = None
-        self.num_vars = 0
-        self.num_constraints = 0
+EPS = 1e-9  # числовой допуск для сравнения с нулем
 
-    def parse_problem(self, text):
-        """Парсинг текстового описания задачи"""
-        lines = [line.strip() for line in text.split('\n') if line.strip()]
+@dataclass
+class LPParsed:
+    """Структура для хранения исходных данных задачи."""
+    sense: str                 # тип задачи: "min" или "max"
+    c: List[float]             # коэффициенты целевой функции для x1..xn
+    constraints: List[Tuple[List[float], str, float]]  # (коэффициенты, знак, правая часть)
+    num_vars: int              # число исходных переменных
+    free_vars: set[int]        # индексы (1-based) свободных переменных
 
-        # Определение типа задачи
-        if 'Максимизировать' in lines[0] or 'максимизировать' in lines[0]:
-            self.problem_type = 'max'
+
+def _strip_spaces(expr: str) -> str:
+    """Убирает лишние пробелы и заменяет минусы на стандартный ASCII-символ."""
+    expr = expr.replace("−", "-").replace("–", "-")
+    expr = re.sub(r"[ \t]+", " ", expr)
+    return expr.strip()
+
+
+def _parse_linear_comb(s: str, num_hint: int | None = None) -> Tuple[List[float], int]:
+    """
+    Разбирает строку линейной комбинации, например:
+        "3x1 - 2 x2 + x4"
+    Возвращает список коэффициентов и максимальный индекс переменной.
+    """
+    s = s.replace("−", "-")
+    # добавляем коэффициент 1, если он не указан явно
+    s = re.sub(r"(^|\s|\+|\-)(?=\s*x\d+)", r"\g<1> 1*", s)
+    s = s.replace("*", "")
+    terms = re.finditer(r"([+-]?\s*\d+(?:\.\d+)?)(?:\s*)x(\d+)", s, flags=re.I)
+    coeffs: Dict[int, float] = {}
+    maxj = 0
+    for m in terms:
+        a = float(m.group(1).replace(" ", ""))
+        j = int(m.group(2))
+        coeffs[j] = coeffs.get(j, 0.0) + a
+        maxj = max(maxj, j)
+    n = max(num_hint or 0, maxj)
+    vec = [0.0] * n
+    for j, a in coeffs.items():
+        vec[j - 1] = a
+    return vec, n
+
+
+def parse_problem(text: str) -> LPParsed:
+    """
+    Парсит текстовую постановку задачи.
+    Поддерживает секции:
+      Objective: max: ...
+      Subject To:
+         ...
+      Bounds: x2 free, x4 free
+    """
+    text = _strip_spaces(text)
+
+    #  Целевая функция
+    m = re.search(r"(?mi)^objective\s*:?\s*(min|max)\s*:\s*(.+)$", text)
+    if not m:
+        m = re.search(r"(?mi)^(min|max)\s*:\s*(.+)$", text)
+    if not m:
+        raise ValueError("Не найдена строка цели. Ожидается, например: 'Objective: max: 3x1 + 2x2'.")
+
+    sense = m.group(1).lower()
+    c_vec, n = _parse_linear_comb(m.group(2))
+
+    # Ограничения
+    block = re.search(r"(?mis)^subject\s*to\s*:?(.*?)(?:^\w|$\Z)", text)
+    cons_text = ""
+    if block:
+        cons_text = block.group(1)
+    else:
+        # fallback: берём все строки с <=, >= или =
+        lines = [ln for ln in text.splitlines() if re.search(r"(<=|≥|>=|=|≤)", ln)]
+        cons_text = "\n".join(lines)
+
+    constraints: List[Tuple[List[float], str, float]] = []
+    for line in cons_text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        line = line.replace("≤", "<=").replace("≥", ">=")
+        mo = re.search(r"(.*?)(<=|>=|=)(.*)$", line)
+        if not mo:
+            continue
+        lhs, rel, rhs = mo.group(1).strip(), mo.group(2), float(mo.group(3))
+        coeffs, n2 = _parse_linear_comb(lhs, n)
+        n = max(n, n2)
+        constraints.append((coeffs, rel, rhs))
+
+    # Секция Bounds (свободные переменные)
+    free_vars: set[int] = set()
+    bmatch = re.search(r"(?mis)^bounds\s*:(.*?)(?:^\w|$\Z)", text)
+    if bmatch:
+        chunk = bmatch.group(1)
+        for token in re.split(r",", chunk):
+            token = token.strip()
+            mm = re.match(r"x(\d+)\s+free", token, flags=re.I)
+            if mm:
+                j = int(mm.group(1))
+                free_vars.add(j)
+
+    # дополняем коэффициенты до полной длины
+    c_vec = (c_vec + [0.0] * n)[:n]
+    return LPParsed(sense=sense, c=c_vec, constraints=constraints, num_vars=n, free_vars=free_vars)
+
+
+@dataclass
+class ExpansionMap:
+    """Отображение между расширенными и исходными переменными."""
+    cols: List[Tuple[int, bool]]  # (индекс исходной, True если x⁺, False если x⁻)
+    n_orig: int                   # число исходных переменных
+
+    def collapse(self, x_ext: List[float]) -> List[float]:
+        """Сворачивает решение из пространства (x⁺, x⁻) обратно в исходные x."""
+        x = [0.0] * self.n_orig
+        for k, (j, is_plus) in enumerate(self.cols):
+            if is_plus:
+                x[j] += x_ext[k]
+            else:
+                x[j] -= x_ext[k]
+        return [0.0 if abs(v) < 1e-9 else v for v in x]
+
+
+def expand_unrestricted(c: List[float],
+                        constraints: List[Tuple[List[float], str, float]],
+                        free: set[int]) -> Tuple[List[float], List[Tuple[List[float], str, float]], ExpansionMap]:
+    """
+    Для каждой свободной переменной x_j создает две неотрицательные:
+        x_j = x_j⁺ - x_j⁻,   x_j⁺ ≥ 0, x_j⁻ ≥ 0
+    Расширяет матрицу ограничений и вектор цели.
+    """
+    n = len(c)
+    new_c: List[float] = []
+    mapping_cols: List[Tuple[int, bool]] = []
+
+    #  Целевая функция
+    for j in range(n):
+        if (j + 1) in free:
+            new_c.extend([c[j], -c[j]])  # xj⁺, xj⁻
+            mapping_cols.append((j, True))
+            mapping_cols.append((j, False))
         else:
-            self.problem_type = 'min'
+            new_c.append(c[j])
+            mapping_cols.append((j, True))
 
-        # Определяем количество переменных
-        self.num_vars = 4  # x1, x2, x3, x4
+    #  Ограничения
+    new_cons: List[Tuple[List[float], str, float]] = []
+    for coeffs, rel, rhs in constraints:
+        row: List[float] = []
+        for j in range(n):
+            a = coeffs[j] if j < len(coeffs) else 0.0
+            if (j + 1) in free:
+                row.extend([a, -a])
+            else:
+                row.append(a)
+        new_cons.append((row, rel, rhs))
 
-        # Извлечение целевой функции
-        objective_match = re.search(r'[Zz]\s*=\s*([\d\.\-\+\*x\s_]+)', lines[0])
-        if objective_match:
-            objective_str = objective_match.group(1)
-            self.c_original = self.parse_expression(objective_str, self.num_vars)
+    return new_c, new_cons, ExpansionMap(cols=mapping_cols, n_orig=n)
 
-        # Парсинг ограничений
-        constraints = []
-        constraint_types = []
 
-        for line in lines[1:]:
-            if '≤' in line or '<=' in line:
-                constraint_types.append('<=')
-                coeffs, rhs = self.parse_constraint(line, self.num_vars)
-                constraints.append((coeffs, rhs))
-            elif '≥' in line or '>=' in line:
-                constraint_types.append('>=')
-                coeffs, rhs = self.parse_constraint(line, self.num_vars)
-                constraints.append((coeffs, rhs))
-            elif '=' in line:
-                constraint_types.append('=')
-                coeffs, rhs = self.parse_constraint(line, self.num_vars)
-                constraints.append((coeffs, rhs))
+@dataclass
+class Tableau:
+    """
+    Симплекс-таблица для системы Ax = b, x ≥ 0.
+    """
+    a: List[List[float]]
+    b: List[float]
+    c: List[float]
+    v: float
+    basis: List[int]
+    var_names: List[str]
 
-        self.num_constraints = len(constraints)
-        return constraints, constraint_types
+    def shape(self) -> Tuple[int, int]:
+        return len(self.b), len(self.c)
 
-    def parse_expression(self, expr, num_vars):
-        """Парсинг математического выражения"""
-        coeffs = [0.0] * num_vars
-
-        # Ищем все слагаемые с переменными
-        pattern = r'([+-]?\s*\d*\.?\d*)\s*\*?\s*x\s*_?\s*(\d+)'
-        matches = re.findall(pattern, expr)
-
-        for coeff_str, var_idx in matches:
-            idx = int(var_idx) - 1
-            if idx >= num_vars:
+    def pivot(self, row: int, col: int):
+        """Выполняет элементарное преобразование таблицы (поворот по элементу (row, col))."""
+        m, n = self.shape()
+        piv = self.a[row][col]
+        if abs(piv) < EPS:
+            raise RuntimeError("Нулевой разрешающий элемент.")
+        inv = 1.0 / piv
+        self.a[row] = [v * inv for v in self.a[row]]
+        self.b[row] *= inv
+        for i in range(m):
+            if i == row:
                 continue
-
-            coeff_str = coeff_str.replace(' ', '')
-
-            if coeff_str == '' or coeff_str == '+':
-                coeff = 1.0
-            elif coeff_str == '-':
-                coeff = -1.0
-            else:
-                coeff = float(coeff_str)
-
-            coeffs[idx] = coeff
-
-        return coeffs
-
-    def parse_constraint(self, line, num_vars):
-        """Парсинг ограничения"""
-        # Определяем тип ограничения
-        if '≤' in line:
-            parts = line.split('≤')
-        elif '>=' in line:
-            parts = line.split('>=')
-        elif '≥' in line:
-            parts = line.split('≥')
-        elif '=' in line:
-            parts = line.split('=')
-        else:
-            return None, None
-
-        left_side = parts[0].strip()
-        right_side = float(parts[1].strip())
-
-        coeffs = self.parse_expression(left_side, num_vars)
-        return coeffs, right_side
-
-    def to_canonical_form(self, constraints, constraint_types):
-        """Приведение к канонической форме"""
-        print("\n=== ПРИВЕДЕНИЕ К КАНОНИЧЕСКОЙ ФОРМЕ ===")
-
-        # Подсчитываем количество дополнительных переменных
-        slack_count = 0
-        artificial_count = 0
-
-        for constr_type in constraint_types:
-            if constr_type == '<=':
-                slack_count += 1
-            elif constr_type == '>=':
-                slack_count += 1  # surplus переменная
-                artificial_count += 1
-            elif constr_type == '=':
-                artificial_count += 1
-
-        self.total_slack = slack_count
-        self.total_artificial = artificial_count
-        total_additional = slack_count + artificial_count
-        self.total_vars = self.num_vars + total_additional
-
-        print(f"Исходных переменных: {self.num_vars}")
-        print(f"Slack/surplus переменных: {slack_count}")
-        print(f"Искусственных переменных: {artificial_count}")
-        print(f"Всего переменных: {self.total_vars}")
-
-        # Создаем расширенную матрицу A
-        A_extended = []
-        b_list = []
-
-        slack_idx = 0
-        artificial_idx = 0
-        self.artificial_vars = []
-
-        print("\nОграничения в канонической форме:")
-        for i, ((coeffs, rhs), constr_type) in enumerate(zip(constraints, constraint_types)):
-            row = coeffs.copy()
-            constraint_str = f"Ограничение {i + 1}: "
-
-            # Добавляем slack/surplus/artificial переменные
-            additional_vars = [0.0] * total_additional
-
-            if constr_type == '<=':
-                # Slack переменная
-                additional_vars[slack_idx] = 1.0
-                constraint_str += " + ".join([f"{coeffs[j]}x_{j + 1}" for j in range(len(coeffs)) if coeffs[j] != 0])
-                constraint_str += f" + s_{slack_idx + 1} = {rhs}"
-                slack_idx += 1
-            elif constr_type == '>=':
-                # Surplus и artificial переменные
-                additional_vars[slack_idx] = -1.0  # surplus
-                artificial_var_idx = slack_count + artificial_idx
-                additional_vars[artificial_var_idx] = 1.0  # artificial
-                self.artificial_vars.append(self.num_vars + artificial_var_idx)
-                constraint_str += " + ".join([f"{coeffs[j]}x_{j + 1}" for j in range(len(coeffs)) if coeffs[j] != 0])
-                constraint_str += f" - s_{slack_idx + 1} + a_{artificial_idx + 1} = {rhs}"
-                slack_idx += 1
-                artificial_idx += 1
-            else:  # '='
-                # Artificial переменная
-                artificial_var_idx = slack_count + artificial_idx
-                additional_vars[artificial_var_idx] = 1.0
-                self.artificial_vars.append(self.num_vars + artificial_var_idx)
-                constraint_str += " + ".join([f"{coeffs[j]}x_{j + 1}" for j in range(len(coeffs)) if coeffs[j] != 0])
-                constraint_str += f" + a_{artificial_idx + 1} = {rhs}"
-                artificial_idx += 1
-
-            full_row = row + additional_vars
-            A_extended.append(full_row)
-            b_list.append(rhs)
-            print(constraint_str)
-
-        self.A = np.array(A_extended, dtype=float)
-        self.b = np.array(b_list, dtype=float)
-
-        # Целевая функция для канонической формы (всегда минимизация)
-        if self.problem_type == 'max':
-            c_extended = [-x for x in self.c_original] + [0.0] * total_additional
-        else:
-            c_extended = self.c_original + [0.0] * total_additional
-
-        self.c = np.array(c_extended, dtype=float)
-
-        print(f"\nЦелевая функция в канонической форме: min {self.c}")
-        print("Матрица A:")
-        print(self.A)
-        print("Вектор b:", self.b)
-        print("Искусственные переменные:", [f"x{i + 1}" for i in self.artificial_vars])
-
-    def find_initial_basis_phase1(self):
-        """Нахождение начального базиса для фазы 1"""
-        basis = []
-
-        # Сначала добавляем искусственные переменные
-        for art_var in self.artificial_vars:
-            basis.append(art_var)
-
-        # Если нужно больше базисных переменных, добавляем slack переменные
-        for j in range(self.num_vars, self.num_vars + self.total_slack):
-            if j not in basis and len(basis) < self.num_constraints:
-                # Проверяем, можно ли добавить эту переменную в базис
-                col = self.A[:, j]
-                # Проверяем, что столбец линейно независим от уже выбранных
-                if len(basis) > 0:
-                    current_basis_matrix = self.A[:, basis]
-                    try:
-                        # Пробуем решить систему чтобы проверить линейную независимость
-                        extended_matrix = np.column_stack([current_basis_matrix, col])
-                        if np.linalg.matrix_rank(extended_matrix) > np.linalg.matrix_rank(current_basis_matrix):
-                            basis.append(j)
-                    except:
-                        basis.append(j)
-                else:
-                    basis.append(j)
-
-        print(f"Начальный базис фазы 1: {[f'x{i + 1}' for i in basis]}")
-        return basis
-
-    def phase1_simplex(self):
-        """Фаза 1: минимизация суммы искусственных переменных"""
-        print("\n=== ФАЗА 1 ===")
-
-        # Создаем целевую функцию для фазы 1
-        c_phase1 = np.zeros(self.total_vars)
-        for art_var in self.artificial_vars:
-            c_phase1[art_var] = 1.0
-
-        print(f"Целевая функция фазы 1: {c_phase1}")
-
-        # Начальный базис
-        basis = self.find_initial_basis_phase1()
-
-        # Решаем симплекс-методом для фазы 1
-        solution, final_basis, msg = self.simplex_core(c_phase1, basis, "Фаза 1")
-
-        if solution is None:
-            return None, None, msg
-
-        # Проверяем, что все искусственные переменные равны 0
-        artificial_sum = sum(solution[i] for i in self.artificial_vars)
-        print(f"Сумма искусственных переменных: {artificial_sum}")
-
-        if artificial_sum > 1e-6:
-            return None, None, "Область допустимых решений пуста"
-
-        # Убираем искусственные переменные из базиса если возможно
-        clean_basis = []
-        for var in final_basis:
-            if var not in self.artificial_vars:
-                clean_basis.append(var)
-
-        # Если нужно, добавляем другие переменные чтобы получить полный базис
-        while len(clean_basis) < self.num_constraints:
-            for j in range(self.total_vars):
-                if j not in clean_basis and j not in self.artificial_vars:
-                    clean_basis.append(j)
-                    break
-
-        return solution, clean_basis, "Фаза 1 завершена успешно"
-
-    def phase2_simplex(self, initial_basis):
-        """Фаза 2: решение исходной задачи"""
-        print("\n=== ФАЗА 2 ===")
-        print(f"Начальный базис: {[f'x{i + 1}' for i in initial_basis]}")
-
-        solution, final_basis, msg = self.simplex_core(self.c, initial_basis, "Фаза 2")
-
-        if solution is None:
-            return None, None, msg
-
-        return solution, final_basis, "Фаза 2 завершена успешно"
-
-    def simplex_core(self, c, initial_basis, phase_name):
-        """Ядро симплекс-метода"""
-        basis = initial_basis.copy()
-        max_iterations = 50
-
-        for iteration in range(max_iterations):
-            print(f"\n{phase_name} - Итерация {iteration + 1}")
-            print(f"Базис: {[f'x{i + 1}' for i in basis]}")
-
-            # 1. Вычисляем базисное решение
-            A_b = self.A[:, basis]
-
-            # Проверяем, что матрица квадратная и невырожденная
-            if A_b.shape[0] != A_b.shape[1]:
-                print(f"Ошибка: матрица A_b не квадратная {A_b.shape}")
-                return None, None, "Матрица не квадратная"
-
-            try:
-                # Проверяем определитель
-                det = np.linalg.det(A_b)
-                if abs(det) < 1e-10:
-                    print("Вырожденная матрица")
-                    # Пробуем найти другой базис
-                    for j in range(self.total_vars):
-                        if j not in basis:
-                            # Пробуем заменить одну переменную в базисе
-                            for i in range(len(basis)):
-                                test_basis = basis.copy()
-                                test_basis[i] = j
-                                test_A_b = self.A[:, test_basis]
-                                if abs(np.linalg.det(test_A_b)) > 1e-10:
-                                    basis = test_basis
-                                    A_b = test_A_b
-                                    print(f"Исправлен базис: {[f'x{i + 1}' for i in basis]}")
-                                    break
-                            break
-
-                x_b = np.linalg.solve(A_b, self.b)
-            except np.linalg.LinAlgError:
-                print("Матрица вырожденная, не удалось решить систему")
-                return None, None, "Вырожденная матрица"
-
-            print(f"Базисное решение: {x_b}")
-
-            # 2. Вычисляем оценки для небазисных переменных
-            non_basis = [j for j in range(self.total_vars) if j not in basis]
-            reduced_costs = []
-
-            c_b = c[basis]
-
-            for j in non_basis:
-                # Вычисляем z_j = c_B * B^{-1} * A_j
-                A_j = self.A[:, j]
-                # Решаем систему B * y = A_j
-                try:
-                    y = np.linalg.solve(A_b, A_j)
-                    z_j = np.dot(c_b, y)
-                    reduced_cost = c[j] - z_j
-                    reduced_costs.append((j, reduced_cost))
-                except:
-                    reduced_costs.append((j, float('inf')))
-
-            # 3. Проверка оптимальности
-            if all(rc[1] >= -1e-6 for rc in reduced_costs):
-                print("Достигнуто оптимальное решение!")
-                # Формируем полное решение
-                x_full = np.zeros(self.total_vars)
-                for i, var_idx in enumerate(basis):
-                    x_full[var_idx] = x_b[i]
-                return x_full, basis, "Оптимально"
-
-            # 4. Выбор вводимой переменной (наименьшая оценка)
-            valid_reduced_costs = [rc for rc in reduced_costs if rc[1] < -1e-6 and not np.isinf(rc[1])]
-            if not valid_reduced_costs:
-                print("Нет переменных с отрицательной оценкой")
-                x_full = np.zeros(self.total_vars)
-                for i, var_idx in enumerate(basis):
-                    x_full[var_idx] = x_b[i]
-                return x_full, basis, "Оптимально"
-
-            entering_var, min_rc = min(valid_reduced_costs, key=lambda x: x[1])
-            print(f"Вводимая переменная: x{entering_var + 1}, оценка: {min_rc:.6f}")
-
-            # 5. Вычисление направления
-            try:
-                d = np.linalg.solve(A_b, self.A[:, entering_var])
-            except:
-                print("Ошибка при вычислении направления")
-                return None, None, "Ошибка вычисления"
-
-            # 6. Проверка на неограниченность
-            if all(d_i <= 1e-10 for d_i in d):
-                print("Задача неограниченна!")
-                return None, None, "Неограниченна"
-
-            # 7. Выбор исключаемой переменной
-            ratios = []
-            for i in range(len(basis)):
-                if d[i] > 1e-10:
-                    ratio = x_b[i] / d[i]
-                    ratios.append((i, ratio, basis[i]))
-                else:
-                    ratios.append((i, float('inf'), basis[i]))
-
-            # Убираем бесконечные отношения
-            valid_ratios = [r for r in ratios if r[1] != float('inf')]
-            if not valid_ratios:
-                print("Нет допустимого решения!")
-                return None, None, "Нет допустимого решения"
-
-            leaving_idx, min_ratio, leaving_var = min(valid_ratios, key=lambda x: x[1])
-            print(f"Исключаемая переменная: x{leaving_var + 1}, отношение: {min_ratio:.6f}")
-
-            # 8. Обновление базиса
-            basis[leaving_idx] = entering_var
-
-        print("Превышено максимальное число итераций!")
-        return None, None, "Превышено число итераций"
-
-    def solve(self, text):
-        """Основной метод решения"""
-        try:
-            # Парсинг задачи
-            constraints, constraint_types = self.parse_problem(text)
-
-            print("Исходная задача:")
-            print(f"Тип: {self.problem_type}")
-            print(f"Целевая функция: Z = {self.c_original}")
-            print("Ограничения:")
-            for i, ((coeffs, rhs), constr_type) in enumerate(zip(constraints, constraint_types)):
-                constraint_str = " + ".join([f"{coeffs[j]}x_{j + 1}" for j in range(len(coeffs)) if coeffs[j] != 0])
-                print(f"  {constraint_str} {constr_type} {rhs}")
-
-            # Приведение к канонической форме
-            self.to_canonical_form(constraints, constraint_types)
-
-            # Двухфазный симплекс-метод
-            if self.artificial_vars:
-                # Фаза 1
-                phase1_solution, phase1_basis, phase1_msg = self.phase1_simplex()
-                if phase1_solution is None:
-                    return {
-                        'status': 'error',
-                        'message': phase1_msg,
-                        'optimal_point': None,
-                        'optimal_value': None
-                    }
-
-                print(f"Фаза 1 успешно завершена. Базис для фазы 2: {[f'x{i + 1}' for i in phase1_basis]}")
-
-                # Фаза 2
-                solution, basis, msg = self.phase2_simplex(phase1_basis)
-            else:
-                # Если нет искусственных переменных, сразу фаза 2
-                initial_basis = self.find_initial_basis_phase1()
-                solution, basis, msg = self.phase2_simplex(initial_basis)
-
-            if solution is None:
-                return {
-                    'status': 'error',
-                    'message': msg,
-                    'optimal_point': None,
-                    'optimal_value': None
-                }
-
-            # Извлекаем только исходные переменные
-            original_solution = solution[:self.num_vars]
-
-            # Вычисляем значение целевой функции
-            if self.problem_type == 'max':
-                optimal_value = np.dot(self.c_original, original_solution)
-            else:
-                optimal_value = np.dot(self.c_original, original_solution)
-
-            return {
-                'status': 'success',
-                'message': msg,
-                'optimal_point': original_solution,
-                'optimal_value': optimal_value,
-                'basis': basis
-            }
-
-        except Exception as e:
-            import traceback
-            return {
-                'status': 'error',
-                'message': f'Ошибка: {str(e)}\n{traceback.format_exc()}',
-                'optimal_point': None,
-                'optimal_value': None
-            }
-
-
-def create_problem_file():
-    """Создание файла с задачей"""
-    problem_text = """Максимизировать Z = 4x_1 + x_2 + 2x_3 + 3x_4
-
-x_1 + x_2 + x_3 <= 9
-x_2 + 2x_3 + x_4 = 7
-x_1 + x_4 >= 3"""
-
-    with open('problem.txt', 'w', encoding='utf-8') as f:
-        f.write(problem_text)
-
-    return problem_text
+            factor = self.a[i][col]
+            if abs(factor) < EPS:
+                continue
+            self.a[i] = [self.a[i][j] - factor * self.a[row][j] for j in range(n)]
+            self.b[i] -= factor * self.b[row]
+        factor = self.c[col]
+        if abs(factor) > EPS:
+            self.c = [self.c[j] - factor * self.a[row][j] for j in range(n)]
+            self.v -= factor * self.b[row]
+        self.basis[row] = col
+
+    def arg_enter_bland(self) -> Optional[int]:
+        """Выбор входящей переменной по правилу Бланда (первая с c_j > 0)."""
+        for j, cj in enumerate(self.c):
+            if cj > EPS:
+                return j
+        return None
+
+    def arg_leave_min_ratio(self, col: int) -> Optional[int]:
+        """Правило минимального отношения (min b_i / a_ij)."""
+        candidates = []
+        for i, aic in enumerate(self.a):
+            if aic[col] > EPS:
+                candidates.append((self.b[i] / aic[col], self.basis[i], i))
+        if not candidates:
+            return None
+        _, _, row = min(candidates, key=lambda t: (t[0], t[1]))
+        return row
+
+
+@dataclass
+class StandardForm:
+    """Каноническая форма задачи: Ax=b, x>=0."""
+    A: List[List[float]]
+    b: List[float]
+    c: List[float]
+    var_names: List[str]
+    slack_idx: List[int]
+    artificial_idx: List[int]
+
+
+def to_standard_form(cons: List[Tuple[List[float], str, float]],
+                     c: List[float]) -> StandardForm:
+    """
+    Приводит задачу к канонической форме, добавляя
+    недостающие переменные (slack, surplus, artificial).
+    При b_i < 0 строки нормализуются (умножаются на −1).
+    """
+    m = len(cons)
+    n = len(c)
+    A: List[List[float]] = []
+    b: List[float] = []
+    var_names = [f"x{j+1}" for j in range(n)]
+    slack_idx: List[int] = []
+    artificial_idx: List[int] = []
+
+    for coeffs, rel, rhs in cons:
+        row = (coeffs + [0.0] * n)[:n]
+        A.append(row)
+        b.append(rhs)
+
+    # Нормализация строк с отрицательными правыми частями
+    for i in range(m):
+        if b[i] < -EPS:
+            A[i] = [-v for v in A[i]]
+            b[i] = -b[i]
+            cons[i] = (cons[i][0], {"<=": ">=", ">=": "<=", "=": "="}[cons[i][1]], -cons[i][2])
+
+    # Добавление дополнительных переменных
+    for i, (_, rel, _) in enumerate(cons):
+        if rel == "<=":
+            for r in range(m):
+                A[r].append(1.0 if r == i else 0.0)
+            slack_idx.append(n); var_names.append(f"s{i+1}")
+            n += 1
+        elif rel == ">=":
+            for r in range(m):
+                A[r].append(-1.0 if r == i else 0.0)
+            slack_idx.append(n); var_names.append(f"s{i+1}")
+            n += 1
+            for r in range(m):
+                A[r].append(1.0 if r == i else 0.0)
+            artificial_idx.append(n); var_names.append(f"a{i+1}")
+            n += 1
+        elif rel == "=":
+            for r in range(m):
+                A[r].append(1.0 if r == i else 0.0)
+            artificial_idx.append(n); var_names.append(f"a{i+1}")
+            n += 1
+
+    return StandardForm(A=A, b=b, c=c, var_names=var_names,
+                        slack_idx=slack_idx, artificial_idx=artificial_idx)
+
+
+def build_phase1_tableau(sf: StandardForm) -> Tableau:
+    """Создаёт таблицу для Фазы I (минимизация суммы искусственных переменных)."""
+    m = len(sf.b)
+    n = len(sf.var_names)
+    a = [row[:] for row in sf.A]
+    b = sf.b[:]
+    c = [0.0] * n
+    for idx in sf.artificial_idx:
+        c[idx] = 1.0  # цель: min Σ a_i  (при решении max меняем знак)
+    basis = [-1] * m
+    for i in range(m):
+        found = False
+        for idx in sf.artificial_idx:
+            if abs(a[i][idx] - 1.0) < EPS and all(abs(a[r][idx]) < EPS for r in range(m) if r != i):
+                basis[i] = idx; found = True; break
+        if found:
+            continue
+        for idx in sf.slack_idx:
+            if abs(a[i][idx] - 1.0) < EPS and all(abs(a[r][idx]) < EPS for r in range(m) if r != i):
+                basis[i] = idx; break
+        if basis[i] == -1:
+            a[i] += [0.0]
+            for r in range(m):
+                a[r].append(1.0 if r == i else 0.0)
+            c.append(1.0)
+            sf.var_names.append(f"a_extra{i+1}")
+            idx_new = len(a[i]) - 1
+            basis[i] = idx_new
+    c = [-v for v in c]
+    v = 0.0
+    for i in range(m):
+        bi = basis[i]
+        if bi in sf.artificial_idx or sf.var_names[bi].startswith("a_extra"):
+            c = [c[j] + a[i][j] for j in range(len(c))]
+            v += b[i]
+    return Tableau(a=a, b=b, c=c, v=-v, basis=basis, var_names=sf.var_names[:])
+
+
+def simplex(tableau: Tableau, max_iter: int = 10_000) -> Tuple[str, Tableau, int]:
+    """Реализация стандартного симплекс-алгоритма (максимизация)."""
+    it = 0
+    while it < max_iter:
+        it += 1
+        col = tableau.arg_enter_bland()
+        if col is None:
+            return "optimal", tableau, it
+        row = tableau.arg_leave_min_ratio(col)
+        if row is None:
+            return "unbounded", tableau, it
+        tableau.pivot(row, col)
+    return "iterations_exceeded", tableau, it
+
+
+def phase1(sf: StandardForm, verbose: bool = True) -> Tuple[str, Tableau, int]:
+    """Фаза I — поиск допустимого базиса."""
+    tab = build_phase1_tableau(sf)
+    if verbose:
+        print("=== ФАЗА I: поиск допустимого базиса ===")
+    status, tab, it = simplex(tab)
+    if status != "optimal":
+        return status, tab, it
+    if tab.v < -EPS:
+        return "infeasible", tab, it
+    # удаляем искусственные переменные
+    keep_cols = [j for j, nm in enumerate(tab.var_names) if not nm.startswith("a")]
+    a2 = [[row[j] for j in keep_cols] for row in tab.a]
+    c2 = [0.0] * len(keep_cols)
+    var_names2 = [tab.var_names[j] for j in keep_cols]
+    mapping = {new_j: old_j for new_j, old_j in enumerate(keep_cols)}
+    basis2 = [next((new_j for new_j, old_j in mapping.items() if old_j == bi), -1) for bi in tab.basis]
+    tab2 = Tableau(a=a2, b=tab.b[:], c=c2, v=0.0, basis=basis2, var_names=var_names2)
+    return "feasible", tab2, it
+
+
+def phase2(tab: Tableau, c_original: List[float], verbose: bool = True) -> Tuple[str, Tableau, int]:
+    """Фаза II — оптимизация исходной целевой функции."""
+    m, n = tab.shape()
+    tab.c = c_original[:] + [0.0] * (n - len(c_original))
+    tab.v = 0.0
+    # Обнуляем коэффициенты по базисным переменным в строке цели
+    for i in range(m):
+        bi = tab.basis[i]
+        coeff = tab.c[bi]
+        if abs(coeff) > EPS:
+            tab.c = [tab.c[j] - coeff * tab.a[i][j] for j in range(n)]
+            tab.v -= coeff * tab.b[i]
+            tab.c[bi] = 0.0
+    if verbose:
+        print("=== ФАЗА II: оптимизация исходной цели ===")
+    return simplex(tab)
+
+
+def solve_from_text(text: str, verbose: bool = True) -> dict:
+    """Главная функция решения ЗЛП из текстовой постановки."""
+    t0 = time.time()
+    parsed = parse_problem(text)
+
+    # Разворачиваем свободные переменные
+    c_ext, cons_ext, exp_map = expand_unrestricted(parsed.c, parsed.constraints, parsed.free_vars)
+
+    # Подготовка цели (задачу min превращаем в max путём умножения на -1)
+    if parsed.sense == "min":
+        c_goal = [-v for v in c_ext]
+        sense_mult = -1.0
+    else:
+        c_goal = c_ext[:]
+        sense_mult = 1.0
+
+    # Каноническая форма
+    sf = to_standard_form(cons_ext, c_goal)
+
+    # Фаза I
+    st1, tab1, it1 = phase1(sf, verbose=verbose)
+    if st1 in ("unbounded", "iterations_exceeded"):
+        return {"status": st1, "iterations": it1, "time_sec": time.time() - t0}
+    if st1 == "infeasible":
+        return {"status": "infeasible", "iterations": it1, "time_sec": time.time() - t0}
+
+    # Фаза II
+    st2, tab2, it2 = phase2(tab1, c_goal, verbose=verbose)
+    if st2 != "optimal":
+        return {"status": st2, "iterations": it1 + it2, "time_sec": time.time() - t0}
+
+    # Восстанавливаем вектор решения (в расширенных координатах)
+    m, n = tab2.shape()
+    x_ext = [0.0] * n
+    for i in range(m):
+        bi = tab2.basis[i]
+        if 0 <= bi < n:
+            x_ext[bi] = tab2.b[i]
+
+    # Оставляем только "истинные" x-столбцы (убираем слэки)
+    keep_cols = [j for j, nm in enumerate(tab2.var_names) if nm.startswith("x")]
+    x_ext_main = [x_ext[j] for j in keep_cols]
+
+    # Сворачиваем обратно к исходным переменным
+    x_orig = exp_map.collapse(x_ext_main)
+
+    # Значение цели с учётом преобразования min/max
+    z = -sense_mult * tab2.v
+
+    t1 = time.time()
+    return {
+        "status": "optimal",
+        "x_original": x_orig,
+        "objective": z,
+        "iterations": it1 + it2,
+        "time_sec": t1 - t0,
+    }
 
 
 def main():
-    """Основная функция"""
-    # Создаем файл с задачей
-    problem_text = create_problem_file()
-
-    # Создаем решатель
-    solver = SimplexSolver()
-
-    # Решаем задачу
-    print("=" * 60)
-    print("РЕШЕНИЕ ЗАДАЧИ ЛИНЕЙНОГО ПРОГРАММИРОВАНИЯ")
-    print("=" * 60)
-
-    result = solver.solve(problem_text)
-
-    print("\n" + "=" * 60)
-    print("РЕЗУЛЬТАТ")
-    print("=" * 60)
-
-    if result['status'] == 'success':
-        print("Решение найдено!")
-        print(f"Оптимальное значение: Z = {result['optimal_value']:.6f}")
-        print("Оптимальная точка:")
-        for i, x_val in enumerate(result['optimal_point']):
-            print(f"  x_{i + 1} = {x_val:.6f}")
-
-        print(f"Базисные переменные: {[f'x{i + 1}' for i in result['basis']]}")
-
-        # Проверка ограничений
-        print("\nПроверка ограничений:")
-        x = result['optimal_point']
-        constraint1 = x[0] + x[1] + x[2]
-        constraint2 = x[1] + 2 * x[2] + x[3]
-        constraint3 = x[0] + x[3]
-
-        print(f"x₁ + x₂ + x₃ = {constraint1:.6f} ≤ 9 ({constraint1 <= 9 + 1e-6})")
-        print(f"x₂ + 2x₃ + x₄ = {constraint2:.6f} = 7 ({abs(constraint2 - 7) < 1e-6})")
-        print(f"x₁ + x₄ = {constraint3:.6f} ≥ 3 ({constraint3 >= 3 - 1e-6})")
-
-    else:
-        print("Решение не найдено")
-        print(f"Причина: {result['message']}")
+    """Точка входа: чтение файла, запуск решения, печать результата."""
+    if len(sys.argv) < 2:
+        print("Использование: python main.py problem.txt")
+        print("\nПример входного файла:\n")
+        sys.exit(1)
+    path = sys.argv[1]
+    with open(path, "r", encoding="utf-8") as f:
+        text = f.read()
+    res = solve_from_text(text, verbose=True)
+    print("\n=== РЕЗУЛЬТАТ ===")
+    for k, v in res.items():
+        if k == "x_original":
+            print(f"{k}: {[round(x, 8) for x in v]}")
+        else:
+            print(f"{k}: {v}")
 
 
 if __name__ == "__main__":

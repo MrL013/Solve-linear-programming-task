@@ -61,7 +61,7 @@ x₁ + x₄ ≥ 3
 В функции create_problem_file напишите целевую функцию и ограничения, после чего будет создан файл problem.txt
 
 Запустите [программу](main.py):
-```python main.py```
+```python main.py problem.txt```
 
 Результат работы можно посмотреть [здесь](result.txt)
 
